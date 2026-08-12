@@ -1,68 +1,91 @@
-# Contributing to @tintinweb/pi-subagents
+# Contributing to LocalPibox Pi-Subagents Fork
 
-This guide exists to save both sides time.
+This fork adds a centralized subagent model registry to `pi-subagents`. This
+document explains how to contribute — whether by improving the LocalPibox patch,
+forking for your own stack, or feeding changes back upstream.
 
-## Philosophy
+## The Patch Model
 
-`pi-subagents` is a [pi](https://pi.dev) extension, and it tries to stay focused:
-spawn and orchestrate autonomous sub-agents that feel native to pi, and do that
-well. Features that don't serve that goal, or that bolt on unrelated complexity,
-are likely to be declined. When in doubt, open an issue and discuss the idea
-before writing the code.
+All LocalPibox changes are kept as a **single squashed commit** on top of
+upstream `master`. This keeps the delta clean and makes rebasing straightforward.
 
-The extension deliberately mirrors Claude Code's tool names, calling
-conventions, and UI patterns. Changes should respect that compatibility unless
-there's a good reason to diverge.
-
-## The One Rule
-
-**You must understand your code.** If you cannot explain what your changes do and
-how they interact with the rest of the system, the PR will be closed.
-
-Using AI to write code is fine. Submitting AI-generated slop without
-understanding it is not.
-
-## Filing Issues
-
-Keep issues short, concrete, and worth reading.
-
-- Keep it concise. If it does not fit on one screen, it is too long.
-- Write in your own voice. If you used an LLM to draft it, review and shape it
-  yourself before posting.
-- State the bug or request clearly, and explain why it matters.
-- For bugs, include a minimal repro: pi version, this extension's version, your
-  agent/config, the steps, and the actual vs. expected behavior.
-- If you want to implement the change yourself, say so.
-
-For security issues, do **not** open a public issue — see [SECURITY.md](SECURITY.md).
-
-## Before Submitting a PR
-
-For anything beyond a trivial fix, open an issue first so we can agree on the
-approach before you invest the time.
-
-Make sure the full check suite passes locally:
-
-```bash
-npm run lint        # biome
-npm run typecheck   # tsc --noEmit
-npm run test        # vitest
-npm run build       # tsc
+```
+upstream master ──→ [v0.14.3] ──┐
+                                 │
+lpb master       ──→ [lpb patch]──┘
 ```
 
-All four must pass. `npm run lint:fix` will auto-fix most style issues, and
-`npm run test:e2e` runs the end-to-end suite if your change touches that surface.
+### Working on a patch
 
-Other guidelines:
+1. Fork or clone `localpibox/pi-subagents`
+2. Make your changes in a feature branch
+3. Squash into one commit: `git commit -S -s --squash`
+4. Push and open a PR against `master`
 
-- Keep PRs focused — one logical change per PR. Unrelated refactors make review
-  harder and are likely to be split out or declined.
-- Add or update tests for behavior you change.
-- Match the surrounding code style (enforced by biome).
-- Do not edit `CHANGELOG.md`. Changelog entries are added by the maintainer.
-- Update the README when you add or change user-facing behavior.
+### Rebasing onto new upstream changes
 
-## Questions?
+```bash
+# Fetch latest upstream
+git fetch https://github.com/tintinweb/pi-subagents.git master:upstream-master
 
-Open an [issue](https://github.com/tintinweb/pi-subagents/issues) — questions and
-discussion are welcome.
+# Rebase the lpb patch
+git checkout master
+git rebase upstream-master
+
+# Resolve conflicts, force-push
+git push --force-with-lease origin master
+```
+
+## Forking for Your Own Stack
+
+If you want to personalize this extension:
+
+1. **Fork** `localpibox/pi-subagents` to your own GitHub account
+2. **Customize** — adjust default agents, add custom model selections, or tweak
+   the registry behavior
+3. **Install** from your fork:
+   ```bash
+   pi install git:github.com/<you>/pi-subagents@<your-branch>
+   ```
+4. **Repoint** any existing installations:
+   ```bash
+   pi remove git:github.com/localpibox/pi-subagents
+   pi install git:github.com/<you>/pi-subagents@<your-branch>
+   ```
+
+See the
+[Forking & Repointing guide](https://github.com/localpibox/devstack#forking--repointing)
+for the full stack procedure.
+
+## Feeding Back Upstream
+
+The LocalPibox patch (centralized model registry) is intended as a **candidate
+upstream contribution**.
+
+1. **Open an issue** on `tintinweb/pi-subagents` describing the use case
+   (non-Anthropic stacks, local model defaults)
+2. **Split your patch** — ensure it's clean and not tied to LocalPibox config
+3. **Submit a PR** against `tintinweb/pi-subagents` master
+4. **Follow up** — if merged, fold into the LocalPibox patch set
+
+### What goes upstream
+
+- ✅ General-purpose features (model registry, parent-model inheritance)
+- ✅ Bug fixes applicable to all installations
+- ✅ Config patterns that help non-default-provider users
+
+### What stays local
+
+- ❌ LocalPibox-specific configuration (hardcoded model names, registry entries)
+- ❌ Stack-specific agent definitions
+
+## Reporting Issues
+
+- **Extension core issues** → [tintinweb/pi-subagents/issues](https://github.com/tintinweb/pi-subagents/issues)
+- **LocalPibox patch issues** → [localpibox/pi-subagents/issues](https://github.com/localpibox/pi-subagents/issues)
+- **Stack configuration** → [localpibox/devstack/issues](https://github.com/localpibox/devstack/issues)
+
+## Communication
+
+- [Pi Discord](https://discord.com/invite/3cU7Bz4UPx) — upstream community
+- Issues and PRs on GitHub — preferred for technical discussions

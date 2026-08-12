@@ -50,6 +50,14 @@ export interface SubagentsSettings {
    */
   scopeModels?: boolean;
   /**
+   * Global default model for subagents. When set, this model string is used as
+   * the fallback for all subagents that don't have an explicit model in their
+   * config. When undefined, subagents inherit the parent session's model.
+   * This is the single source of truth for subagent model defaults — configure
+   * it to ensure no hardcoded Anthropic/OpenRouter models leak into agent spawns.
+   */
+  globalDefaultModel?: string;
+  /**
    * When true, the three built-in default agents (general-purpose, Explore, Plan)
    * are not registered at startup. User-defined agents from project/global custom
    * agent dirs are completely unaffected — only the hardcoded DEFAULT_AGENTS are suppressed.
@@ -129,6 +137,7 @@ export interface SettingsAppliers {
   setDefaultJoinMode: (mode: JoinMode) => void;
   setSchedulingEnabled: (b: boolean) => void;
   setScopeModels: (enabled: boolean) => void;
+  setGlobalDefaultModel: (model: string) => void;
   setDisableDefaultAgents: (b: boolean) => void;
   setToolDescriptionMode: (mode: ToolDescriptionMode) => void;
   setFleetView: (b: boolean) => void;
@@ -194,6 +203,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   }
   if (typeof r.scopeModels === "boolean") {
     out.scopeModels = r.scopeModels;
+  }
+  if (typeof r.globalDefaultModel === "string") {
+    out.globalDefaultModel = r.globalDefaultModel;
   }
   if (typeof r.disableDefaultAgents === "boolean") {
     out.disableDefaultAgents = r.disableDefaultAgents;
@@ -278,6 +290,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);
   if (typeof s.scopeModels === "boolean") appliers.setScopeModels(s.scopeModels);
+  if (typeof s.globalDefaultModel === "string") appliers.setGlobalDefaultModel(s.globalDefaultModel);
   if (typeof s.disableDefaultAgents === "boolean") appliers.setDisableDefaultAgents(s.disableDefaultAgents);
   if (s.toolDescriptionMode) appliers.setToolDescriptionMode(s.toolDescriptionMode);
   if (typeof s.fleetView === "boolean") appliers.setFleetView(s.fleetView);

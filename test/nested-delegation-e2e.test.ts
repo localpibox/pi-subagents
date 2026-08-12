@@ -13,8 +13,7 @@
  *
  * Deliberately faux, not live: `PI_E2E_LIVE=1` cannot drive a three-level chain
  * deterministically, and a live model choosing not to delegate would look like
- * a passing test. Each run therefore pins `live: false` rather than trusting the
- * env var to leave it alone — the pre-publish smoke sets it globally.
+ * a passing test.
  */
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -158,7 +157,6 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
       prompt: "Delegate the work.",
       cwd,
       respond,
-      live: false,
       beforeRun: () => { registerAgents(loadCustomAgents(cwd)); },
     });
 
@@ -222,7 +220,6 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
         prompt: "Delegate the work.",
         cwd,
         respond,
-        live: false,
         beforeRun: () => { registerAgents(loadCustomAgents(cwd)); },
       });
 

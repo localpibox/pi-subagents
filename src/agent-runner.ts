@@ -320,15 +320,27 @@ export function getGraceTurns(): number { return graceTurns; }
 /** Set the grace turns value (minimum 1). */
 export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
 
+/** Global default model for subagents (from pi-defaults.json / subagents.json). */
+let globalDefaultModel: string | undefined;
+
+/** Get the global default model. */
+export function getGlobalDefaultModel(): string | undefined { return globalDefaultModel; }
+/** Set the global default model. */
+export function setGlobalDefaultModel(model: string): void { globalDefaultModel = model; }
+
 /**
  * Try to find the right model for an agent type.
- * Priority: explicit option > config.model > parent model.
+ * Priority: explicit option > config.model > globalDefaultModel > parent model.
+ * globalDefaultModel comes from pi-defaults.json / subagents.json and is the
+ * single source of truth for subagent model defaults.
  */
 function resolveDefaultModel(
   parentModel: Model<any> | undefined,
   registry: { find(provider: string, modelId: string): Model<any> | undefined; getAvailable?(): Model<any>[] },
   configModel?: string,
+  globalDefaultModel?: string,
 ): Model<any> | undefined {
+  // 1. Try configModel (from agent .md file or DEFAULT_AGENTS)
   if (configModel) {
     const slashIdx = configModel.indexOf("/");
     if (slashIdx !== -1) {
@@ -348,6 +360,13 @@ function resolveDefaultModel(
     }
   }
 
+  // 2. Try globalDefaultModel (from pi-defaults.json / subagents.json)
+  // This is the centralized registry — the single source of truth.
+  if (globalDefaultModel) {
+    return resolveDefaultModel(parentModel, registry, globalDefaultModel);
+  }
+
+  // 3. Fall back to parent model (inherit)
   return parentModel;
 }
 
@@ -733,9 +752,10 @@ export async function runAgent(
     }
   }
 
-  // Resolve model: explicit option > config.model > parent model
+  // Resolve model: explicit option > config.model > globalDefaultModel > parent model
   const model = options.model ?? resolveDefaultModel(
     ctx.model, ctx.modelRegistry, agentConfig?.model,
+    globalDefaultModel, // from subagents.json / pi-defaults.json
   );
 
   // Resolve thinking level: explicit option > agent config > undefined (inherit)

@@ -17,7 +17,7 @@ import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Tex
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { AgentManager } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
+import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getGlobalDefaultModel, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setGlobalDefaultModel, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -755,6 +755,7 @@ export default function (pi: ExtensionAPI) {
       setDefaultJoinMode,
       setSchedulingEnabled,
       setScopeModels: setScopeModelsEnabled,
+      setGlobalDefaultModel,
       setDisableDefaultAgents: setDisableDefaultAgents,
       setToolDescriptionMode: setToolDescriptionMode,
       setFleetView: setFleetViewEnabled,
@@ -1092,12 +1093,20 @@ Terse command-style prompts produce shallow, generic work.
       const resolvedConfig = resolveAgentInvocationConfig(customConfig, params);
 
       // Resolve model from agent config first; tool-call params only fill gaps.
+      // Priority: explicit param > agent config > globalDefaultModel > parent model.
       let model = ctx.model;
       if (resolvedConfig.modelInput) {
         const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
           if (resolvedConfig.modelFromParams) return textResult(resolved);
-          // config-specified: silent fallback to parent
+          // config-specified: try globalDefaultModel, then fall back to parent
+          const fallbackModel = getGlobalDefaultModel();
+          if (fallbackModel) {
+            const fallbackResolved = resolveModel(fallbackModel, ctx.modelRegistry);
+            if (typeof fallbackResolved !== "string") {
+              model = fallbackResolved;
+            }
+          }
         } else {
           model = resolved;
         }
@@ -2001,7 +2010,7 @@ The file format is a markdown file with YAML frontmatter and a system prompt bod
 ---
 description: <one-line description shown in UI>
 tools: <comma-separated built-in tools: read, bash, edit, write, grep, find, ls. Use "none" for no tools. Omit for all tools>
-model: <optional model as "provider/modelId", e.g. "anthropic/claude-haiku-4-5". Omit to inherit parent model>
+model: <optional model as "provider/modelId". Omit to inherit parent model>
 thinking: <optional thinking level: ${THINKING_LEVELS.join(", ")}. Omit to inherit>
 max_turns: <optional max agentic turns. 0 or omit for unlimited (default)>
 prompt_mode: <"replace" (body IS the full system prompt) or "append" (body is appended to default prompt). Default: replace>
@@ -2079,21 +2088,16 @@ Write the file using the write tool. Only write the file, nothing else.`;
     // 4. Model
     const modelChoice = await ctx.ui.select("Model", [
       "inherit (parent model)",
-      "haiku",
-      "sonnet",
-      "opus",
-      "custom...",
+      "custom model (provider/modelId)",
     ]);
     if (!modelChoice) return;
 
     let modelLine = "";
-    if (modelChoice === "haiku") modelLine = "\nmodel: anthropic/claude-haiku-4-5";
-    else if (modelChoice === "sonnet") modelLine = "\nmodel: anthropic/claude-sonnet-4-6";
-    else if (modelChoice === "opus") modelLine = "\nmodel: anthropic/claude-opus-4-6";
-    else if (modelChoice === "custom...") {
+    if (modelChoice === "custom model (provider/modelId)") {
       const customModel = await ctx.ui.input("Model (provider/modelId)");
       if (customModel) modelLine = `\nmodel: ${customModel}`;
     }
+    // "inherit (parent model)" → no model field = inherits parent model (Qwen on lemonade)
 
     // 5. Thinking
     // "inherit" is a UI-only pseudo-choice (omit the field); the rest mirror pi.

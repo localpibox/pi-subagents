@@ -34,10 +34,9 @@ export const DEFAULT_AGENTS: Map<string, AgentConfig> = new Map([
       builtinToolNames: READ_ONLY_TOOLS,
       extensions: true,
       skills: true,
-      // Fast/cheap model for read-only search. Provider-preferred but resilient:
-      // resolveModel matches this fuzzily (date-stamp optional) and falls back to
-      // the same model under another provider if anthropic doesn't expose it.
-      model: "anthropic/claude-haiku-4-5",
+      // No hardcoded model — inherits parent model from user's defaultModel.
+      // User can override via pi-defaults.json or per-agent model field.
+      model: undefined, // inherit parent model
       systemPrompt: `# CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS
 You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
 Your role is EXCLUSIVELY to search and analyze existing code. You do NOT have access to file editing tools.
