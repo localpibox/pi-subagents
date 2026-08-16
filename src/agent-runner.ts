@@ -334,7 +334,7 @@ export function setGlobalDefaultModel(model: string): void { globalDefaultModel 
  * globalDefaultModel comes from pi-defaults.json / subagents.json and is the
  * single source of truth for subagent model defaults.
  */
-function resolveDefaultModel(
+export function resolveDefaultModel(
   parentModel: Model<any> | undefined,
   registry: { find(provider: string, modelId: string): Model<any> | undefined; getAvailable?(): Model<any>[] },
   configModel?: string,
@@ -389,6 +389,12 @@ export interface RunOptions {
   thinkingLevel?: ThinkingLevel;
   /** Override working directory (e.g. for worktree isolation). */
   cwd?: string;
+  /**
+   * Directory the worktree copy was created from. Set only when `cwd` points
+   * into a worktree — the prompt then tells the agent to stay in the copy
+   * instead of following the inherited parent prompt back to the main tree.
+   */
+  worktreeBase?: string;
   /**
    * Where .pi config is discovered (project extensions, skills, pi settings,
    * agent memory). Default: same as the working directory. The manager sets
@@ -555,6 +561,7 @@ export async function runAgent(
 
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
+  if (options.worktreeBase) extras.worktreeBase = options.worktreeBase;
 
   // Resolve extensions/skills: isolated overrides to false
   const extensions = options.isolated ? false : config.extensions;
@@ -851,7 +858,9 @@ export async function runAgent(
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
   const sessionManager = agentConfig?.persistSession
-    ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir)
+    ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir, {
+        parentSession: ctx.sessionManager.getSessionFile(),
+      })
     : SessionManager.inMemory(effectiveCwd);
 
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
@@ -867,7 +876,11 @@ export async function runAgent(
     sessionManager,
     settingsManager,
     modelRegistry: ctx.modelRegistry,
-    ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime }),
+    // `as never` is what keeps this assignable across the supported Pi range:
+    // pre-0.80.8 the field exists only via the `modelRuntime?: unknown` shim
+    // above, while newer Pi types it as `ModelRuntime` — a shape an opaque
+    // `unknown` read off the private facade field can never satisfy.
+    ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime as never }),
     model,
     tools: sessionTools,
     customTools: nestedTools,

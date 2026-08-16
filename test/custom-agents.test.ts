@@ -1,9 +1,11 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { serializeAgentFile } from "../src/agent-file-toggle.js";
 import { BUILTIN_TOOL_NAMES } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
+import type { AgentConfig } from "../src/types.js";
 
 describe("loadCustomAgents", () => {
   let tmpDir: string;
@@ -149,6 +151,8 @@ Just a prompt.`);
     const agent = result.get("minimal")!;
 
     expect(agent.name).toBe("minimal");
+    expect(agent.displayName).toBeUndefined();
+    expect(agent.color).toBeUndefined();
     expect(agent.description).toBe("minimal"); // defaults to filename
     expect(agent.builtinToolNames).toEqual(BUILTIN_TOOL_NAMES); // all tools
     expect(agent.extensions).toBe(true); // inherit all
@@ -580,8 +584,9 @@ enabled: false
     expect(agent.enabled).toBe(false);
   });
 
-  it("parses display_name frontmatter", () => {
+  it("parses display_name frontmatter and gives it precedence over Claude Code name", () => {
     writeAgent("myagent", `---
+name: Claude Name
 description: My Agent
 display_name: MyAgent
 ---
@@ -590,6 +595,21 @@ Agent prompt.`);
 
     const result = loadCustomAgents(tmpDir);
     expect(result.get("myagent")!.displayName).toBe("MyAgent");
+  });
+
+  it("uses Claude Code name as the display-name fallback", () => {
+    writeAgent("code-reviewer", `---
+name: Code Reviewer
+description: Reviews code
+color: "#8B5CF6"
+---
+
+Agent prompt.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("code-reviewer")!.name).toBe("code-reviewer");
+    expect(result.get("code-reviewer")!.displayName).toBe("Code Reviewer");
+    expect(result.get("code-reviewer")!.color).toBe("#8B5CF6");
   });
 
   it("parses disallowed_tools as csv list", () => {
@@ -695,6 +715,154 @@ Bad isolation.`);
     expect(result.get("bad-isolation")!.isolation).toBeUndefined();
   });
 
+  // A YAML error in one file used to escape loadFromDir and abort the whole
+  // extension load — pi exited 1 before the TUI. Regression for #212.
+  it("skips a file with malformed frontmatter and still loads the others", () => {
+    // Unquoted `description` containing ": " — the shape Claude Code tolerates.
+    writeAgent("broken", `---
+name: broken
+description: Use this: that
+---
+
+Broken body.`);
+    writeAgent("good", `---
+description: Still loads
+---
+
+Good body.`);
+
+    const result = loadCustomAgents(tmpDir);
+
+    expect(result.has("broken")).toBe(false);
+    expect(result.get("good")?.description).toBe("Still loads");
+  });
+
+  it("names the offending file and the reason when skipping it", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeAgent("broken", "---\nname: broken\ndescription: Use this: that\n---\n\nBroken body.");
+
+      loadCustomAgents(tmpDir);
+
+      const message = warn.mock.calls.map(args => String(args[0])).join("\n");
+      expect(message).toContain(join(tmpDir, ".pi", "agents", "broken.md"));
+      expect(message).toContain("Nested mappings are not allowed");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // Skipping an override is not the same as skipping an agent: the name still
+  // resolves, to a different prompt, model and tool policy. Nothing downstream
+  // can flag that, because the Agent call succeeds.
+  it("warns when a skipped file was overriding an agent that stays resolvable", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeWorkspaceAgent("dup", "---\ndescription: Earlier definition\n---\n\nEarlier body.");
+      writeAgent("dup", "---\nname: dup\ndescription: Use this: that\n---\n\nBroken body.");
+
+      const result = loadCustomAgents(tmpDir);
+
+      expect(result.get("dup")?.description).toBe("Earlier definition");
+      const message = warn.mock.calls.map(args => String(args[0])).join("\n");
+      expect(message).toContain(`Agent "dup" now loads from ${join(tmpDir, ".agents", "agents", "dup.md")} instead`);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // A disabled agent does not dispatch (resolveEnabledTypeIn), so claiming the
+  // name "still resolves" to it would send the user chasing the wrong file.
+  it("does not claim a fallback when the shadowed definition is disabled", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeWorkspaceAgent("dup", "---\ndescription: Earlier definition\nenabled: false\n---\n\nEarlier body.");
+      writeAgent("dup", "---\nname: dup\ndescription: Use this: that\n---\n\nBroken body.");
+
+      loadCustomAgents(tmpDir);
+
+      const message = warn.mock.calls.map(args => String(args[0])).join("\n");
+      expect(message).toContain("Skipping agent file");
+      expect(message).not.toContain("now loads from");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not claim a fallback when the skipped file overrode nothing", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeAgent("lonely", "---\nname: lonely\ndescription: Use this: that\n---\n\nBroken body.");
+
+      loadCustomAgents(tmpDir);
+
+      const message = warn.mock.calls.map(args => String(args[0])).join("\n");
+      expect(message).toContain("Skipping agent file");
+      expect(message).not.toContain("now loads from");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // strictAgentFiles: opt in to failing closed rather than running a substitute.
+  it("throws naming the file when strict, and skips it when not", () => {
+    writeAgent("broken", "---\nname: broken\ndescription: Use this: that\n---\n\nBroken.");
+    writeAgent("healthy", "---\ndescription: Fine\n---\n\nFine.");
+    const brokenPath = join(tmpDir, ".pi", "agents", "broken.md");
+
+    expect(() => loadCustomAgents(tmpDir, true)).toThrow(brokenPath);
+    expect(() => loadCustomAgents(tmpDir, true)).toThrow("Nested mappings are not allowed");
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = loadCustomAgents(tmpDir);
+      expect(result.has("broken")).toBe(false);
+      expect(result.has("healthy")).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // The rule is "warn when it breaks, stay quiet while it stays broken".
+  // Suppressing an unchanged problem must not suppress it forever.
+  it("warns when a file breaks, not while it stays broken", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // Two loads while broken: the second must be suppressed as unchanged.
+      writeAgent("flip", "---\nname: flip\ndescription: Use this: that\n---\n\nBroken.");
+      loadCustomAgents(tmpDir);
+      loadCustomAgents(tmpDir);
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      writeAgent("flip", "---\ndescription: Fixed\n---\n\nFixed.");
+      expect(loadCustomAgents(tmpDir).get("flip")?.description).toBe("Fixed");
+
+      // Same breakage again — a new problem, not the one already reported.
+      writeAgent("flip", "---\nname: flip\ndescription: Use this: that\n---\n\nBroken.");
+      loadCustomAgents(tmpDir);
+
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // Agents reload on every Agent call, so repeating would scribble a live TUI.
+  it("warns once per message, not on every reload", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeAgent("noisy", "---\nname: noisy\ndescription: Use this: that\n---\n\nBroken body.");
+
+      loadCustomAgents(tmpDir);
+      loadCustomAgents(tmpDir);
+      loadCustomAgents(tmpDir);
+
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("honors PI_CODING_AGENT_DIR for global custom agent discovery", () => {
     const altAgentDir = mkdtempSync(join(tmpdir(), "pi-alt-agent-"));
     const originalEnv = process.env.PI_CODING_AGENT_DIR;
@@ -717,5 +885,102 @@ Bad isolation.`);
       else process.env.PI_CODING_AGENT_DIR = originalEnv;
       rmSync(altAgentDir, { recursive: true, force: true });
     }
+  });
+
+  // `/agents → Eject` writes an AgentConfig back out as frontmatter. That writer
+  // and this loader are the two halves of one format, but nothing pinned them
+  // together — so a field can serialize to something the loader reads back
+  // differently, and the agent silently changes shape on eject.
+  describe("eject round-trip", () => {
+    function roundTrip(cfg: Partial<AgentConfig>) {
+      const full: AgentConfig = {
+        description: "Round trip agent",
+        systemPrompt: "Body prompt.",
+        promptMode: "append",
+        ...cfg,
+      } as AgentConfig;
+      writeAgent("rt", serializeAgentFile(full));
+      const loaded = loadCustomAgents(tmpDir).get("rt");
+      expect(loaded).toBeDefined();
+      return loaded!;
+    }
+
+    it("preserves an explicitly narrowed tool list", () => {
+      expect(roundTrip({ builtinToolNames: ["read", "grep"] }).builtinToolNames).toEqual(["read", "grep"]);
+    });
+
+    it("preserves the full built-in set", () => {
+      expect(roundTrip({ builtinToolNames: [...BUILTIN_TOOL_NAMES] }).builtinToolNames)
+        .toEqual([...BUILTIN_TOOL_NAMES]);
+    });
+
+    it("preserves an empty tool list instead of widening it to every built-in", () => {
+      // `tools: none` parses to [] on load, so ejecting an agent with zero
+      // built-ins must not write `tools: all` — that hands it the whole toolbox.
+      expect(roundTrip({ builtinToolNames: [] }).builtinToolNames).toEqual([]);
+    });
+
+    it("preserves the scalar and list fields it writes", () => {
+      const loaded = roundTrip({
+        displayName: "RT",
+        model: "anthropic/claude-haiku-4-5",
+        thinking: "low",
+        maxTurns: 7,
+        allowedSubagents: ["Explore"],
+        excludeExtensions: ["ext-beta"],
+        disallowedTools: ["write"],
+        inheritContext: true,
+        runInBackground: true,
+        outputTranscript: false,
+        isolated: true,
+        memory: "project",
+        isolation: "worktree",
+      });
+      expect(loaded.displayName).toBe("RT");
+      expect(loaded.model).toBe("anthropic/claude-haiku-4-5");
+      expect(loaded.thinking).toBe("low");
+      expect(loaded.maxTurns).toBe(7);
+      expect(loaded.allowedSubagents).toEqual(["Explore"]);
+      expect(loaded.excludeExtensions).toEqual(["ext-beta"]);
+      expect(loaded.disallowedTools).toEqual(["write"]);
+      expect(loaded.inheritContext).toBe(true);
+      expect(loaded.runInBackground).toBe(true);
+      expect(loaded.outputTranscript).toBe(false);
+      expect(loaded.isolated).toBe(true);
+      expect(loaded.memory).toBe("project");
+      expect(loaded.isolation).toBe("worktree");
+    });
+
+    it("preserves the extension and skill list fields", () => {
+      // These serialize as bare CSV and are re-parsed by parseExtensionsSpec /
+      // the skills field. A generate/parse mismatch here is silent: the ejected
+      // agent loads fine but with a different extension or skill scope than the
+      // one that was ejected.
+      const loaded = roundTrip({
+        extensions: ["mcp", "pi-notify"],
+        skills: ["planning", "review"],
+        disallowedTools: ["write", "edit"],
+      });
+      expect(loaded.extensions).toEqual(["mcp", "pi-notify"]);
+      expect(loaded.skills).toEqual(["planning", "review"]);
+      expect(loaded.disallowedTools).toEqual(["write", "edit"]);
+    });
+
+    it("preserves the boolean forms of extensions and skills", () => {
+      const off = roundTrip({ extensions: false, skills: false });
+      expect(off.extensions).toBe(false);
+      expect(off.skills).toBe(false);
+    });
+
+    it("preserves allowed_subagents in both its list and `all` forms", () => {
+      expect(roundTrip({ allowedSubagents: "all" }).allowedSubagents).toBe("all");
+      expect(roundTrip({ allowedSubagents: ["Explore", "Plan"] }).allowedSubagents)
+        .toEqual(["Explore", "Plan"]);
+    });
+
+    it("preserves a description containing a colon", () => {
+      // Serialized via JSON.stringify precisely so YAML doesn't split on the colon.
+      expect(roundTrip({ description: "Scout: find things" }).description).toBe("Scout: find things");
+    });
   });
 });

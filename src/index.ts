@@ -16,6 +16,8 @@ import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type Exten
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
+import { hasAgentBadge, renderAgentName } from "./agent-color.js";
+import { buildNewAgentFile, disableInContent, enableInContent, findAgentFile, isEmptyStub, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getGlobalDefaultModel, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setGlobalDefaultModel, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
@@ -27,10 +29,10 @@ import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-conf
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
-import { createOutputFilePath, getOutputTranscriptDefault, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import {
@@ -52,6 +54,7 @@ import {
 } from "./ui/agent-widget.js";
 import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
+import { selectItem } from "./ui/select-item.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
 
 // ---- Shared helpers ----
@@ -223,6 +226,43 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
   };
 }
 
+/**
+ * Format an agent's tool scope for the Agent tool description.
+ *
+ * This suffix describes BUILT-IN scope only — extension tools are resolved when
+ * the agent runs (extensions can register asynchronously), so they cannot be
+ * enumerated while the description is being built. That is why an agent with
+ * `tools: "*, ext:mcp/search"` renders "*" and always has.
+ *
+ * Two distinctions matter, both of them capability claims the orchestrator acts on:
+ *
+ * - absent vs empty. `builtinToolNames: undefined` means the agent never narrowed
+ *   its tools (the shipped defaults); `[]` is what `tools: none` and an `ext:`-only
+ *   `tools:` parse to, and the runtime really does hand those agents no built-ins.
+ *   Rendering both "*" tells the orchestrator a tool-less agent can run `bash`.
+ * - empty-with-extensions vs empty-without. Zero built-ins does NOT imply zero
+ *   tools: `tools: none` alongside `extensions:` still surfaces every extension
+ *   tool (see test/fixtures/.pi/agents/tools-none.md, which expects three). Calling
+ *   that "none" understates the agent instead of overstating it — better, but still
+ *   wrong, and it would route work away from the only agent able to do it. "none"
+ *   is therefore reserved for agents that genuinely can call nothing: `isolated`
+ *   agents and those with `extensions: false`.
+ */
+export function formatToolsSuffix(cfg: AgentConfig | undefined): string {
+  const tools = cfg?.builtinToolNames;
+  if (!tools) return "*";
+  if (tools.length === 0) {
+    // `isolated` overrides extensions to false in the runner, so both mean the
+    // agent has no extension tools either — and then it truly has nothing.
+    const noExtensionTools = cfg?.isolated === true || cfg?.extensions === false;
+    return noExtensionTools ? "none" : "no built-ins, extension tools only";
+  }
+  const isFullSet =
+    tools.length === BUILTIN_TOOL_NAMES.length
+    && BUILTIN_TOOL_NAMES.every((t) => tools.includes(t));
+  return isFullSet ? "*" : tools.join(", ");
+}
+
 export default function (pi: ExtensionAPI) {
   // Child AgentSessions load normal extensions. Re-entering this extension there
   // would create another manager and leak handlers. Nested orchestration is
@@ -278,14 +318,19 @@ export default function (pi: ExtensionAPI) {
     }
   );
 
+  // Read directly rather than waiting for applyAndEmitLoaded below: this decides
+  // the initial load, which happens hundreds of lines before settings are applied.
+  let strictAgentFiles = loadSettings(process.cwd()).strictAgentFiles === true;
+
   /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
-  const reloadCustomAgents = () => {
-    const userAgents = loadCustomAgents(process.cwd());
+  const reloadCustomAgents = (strict = false) => {
+    const userAgents = loadCustomAgents(process.cwd(), strict);
     registerAgents(userAgents);
   };
 
-  // Initial load
-  reloadCustomAgents();
+  // Initial load — the only strict one. A bad edit mid-session must not kill the
+  // session on the next unrelated spawn, so every later reload keeps warning.
+  reloadCustomAgents(strictAgentFiles);
 
   // ---- Agent activity tracking + widget ----
   const agentActivity = new Map<string, AgentActivity>();
@@ -444,6 +489,14 @@ export default function (pi: ExtensionAPI) {
     widget.update();
   }, undefined, (record) => {
     if (record.parentAgentId) return;
+    // Agent-tool spawns refresh these surfaces in their tool handler, but RPC
+    // and scheduler spawns enter through the manager directly.
+    if (currentCtx?.hasUI) {
+      widget.ensureTimer();
+      widget.update();
+      fleet.ensureTimer();
+      fleet.update();
+    }
     // Emit started event when agent transitions to running (including from queue)
     pi.events.emit("subagents:started", {
       id: record.id,
@@ -545,6 +598,10 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    if (ctx.hasUI) {
+      widget.setUICtx(ctx.ui);
+      fleet.setUICtx(ctx.ui as any);
+    }
     manager.clearCompleted(true);
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
@@ -701,16 +758,6 @@ export default function (pi: ExtensionAPI) {
     widget.onTurnStart();
   });
 
-  /** Format an agent's tool scope: "*" when it has all built-ins, else a comma-separated list. */
-  const formatToolsSuffix = (cfg: AgentConfig | undefined): string => {
-    const tools = cfg?.builtinToolNames;
-    if (!tools || tools.length === 0) return "*";
-    const isFullSet =
-      tools.length === BUILTIN_TOOL_NAMES.length
-      && BUILTIN_TOOL_NAMES.every((t) => tools.includes(t));
-    return isFullSet ? "*" : tools.join(", ");
-  };
-
   /** Build the full type list text dynamically from available agents only. */
   const buildTypeListText = () => {
     const available = getAvailableTypes();
@@ -756,6 +803,7 @@ export default function (pi: ExtensionAPI) {
       setSchedulingEnabled,
       setScopeModels: setScopeModelsEnabled,
       setGlobalDefaultModel,
+      setStrictAgentFiles: (b) => { strictAgentFiles = b; },
       setDisableDefaultAgents: setDisableDefaultAgents,
       setToolDescriptionMode: setToolDescriptionMode,
       setFleetView: setFleetViewEnabled,
@@ -941,7 +989,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
       resume: Type.Optional(
         Type.String({
-          description: "Optional agent ID to resume from. Continues from previous context.",
+          description: "Optional agent ID to resume from. Continues from previous context. Combine with run_in_background to resume detached and be notified on completion. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
         }),
       ),
       isolated: Type.Optional(
@@ -964,16 +1012,34 @@ Terse command-style prompts produce shallow, generic work.
 
     // ---- Custom rendering: Claude Code style ----
 
-    renderCall(args, theme) {
-      const displayName = args.subagent_type ? getDisplayName(args.subagent_type) : "Agent";
+    renderCall(args, theme, context) {
+      // A badge closes its own background, which would clear the tool block's row tint
+      // for the rest of the line, so the badge restores it. The tint is opened here too:
+      // the TUI's Box paints it, but HTML export takes it from CSS, and restoring a
+      // background the line never opened is what banded the export before. The line is
+      // deliberately left open — Box.applyBackgroundToLine pads to width and *then*
+      // wraps, so closing here would leave that padding untinted, and HTML export closes
+      // any open span per line anyway. No badge means no tint, so an uncolored agent
+      // renders exactly the line it always did.
+      const rowBackground = hasAgentBadge(args.subagent_type)
+        ? theme.getBgAnsi(context.isPartial ? "toolPendingBg" : context.isError ? "toolErrorBg" : "toolSuccessBg")
+        : "";
       const desc = args.description ?? "";
-      return new Text("▸ " + theme.fg("toolTitle", theme.bold(displayName)) + (desc ? "  " + theme.fg("muted", desc) : ""), 0, 0);
+      const name = renderAgentName(args.subagent_type, theme, {
+        fallbackColor: "toolTitle",
+        restoreBackground: rowBackground,
+        bold: true,
+      });
+      return new Text(rowBackground + "▸ " + name + (desc ? "  " + theme.fg("muted", desc) : ""), 0, 0);
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, { expanded, isPartial }, theme, renderContext) {
       const details = result.details as AgentDetails | undefined;
-      if (!details) {
-        const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      // Pi reports pre-execution failures (extension block, abort, argument
+      // validation) as `{ content: [reason], details: {} }` with isError set —
+      // no status to render, so show the reason instead of inventing one (#199).
+      if (renderContext.isError || !details?.status) {
         return new Text(text, 0, 0);
       }
 
@@ -1035,6 +1101,12 @@ Terse command-style prompts produce shallow, generic work.
         let line = theme.fg("dim", "■") + (s ? " " + s : "");
         line += "\n" + theme.fg("dim", "  ⎿  Stopped");
         return new Text(line, 0, 0);
+      }
+
+      // Anything left ("queued", or a status added later) has no rendering of
+      // its own — the turn-limit wording below must not be the catch-all.
+      if (details.status !== "error" && details.status !== "aborted") {
+        return new Text(text, 0, 0);
       }
 
       // ---- Error / Aborted (hard max_turns) ----
@@ -1224,6 +1296,108 @@ Terse command-style prompts produce shallow, generic work.
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
+
+        // Background resume: detached run that notifies on completion, mirroring
+        // a background spawn. Previously run_in_background was silently ignored
+        // on resume (this branch returned before the background branch below),
+        // so a resumed agent always blocked the main loop until it finished.
+        if (runInBackground) {
+          const id = existing.id;
+          // A detached resume hands control back while the record stays
+          // "running", so nothing stops the model from resuming the same agent
+          // again mid-run. manager.resume() refuses that (it would orphan the
+          // live run's abort controller); say why here, where the model can act
+          // on it, instead of letting it read as a generic failure.
+          if (existing.status === "running" || existing.status === "queued") {
+            return textResult(
+              `Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
+              `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+            );
+          }
+
+          const joinMode = resolveJoinMode(defaultJoinMode, true);
+          existing.toolCallId = toolCallId;
+          if (joinMode) existing.joinMode = joinMode;
+          // Reuse the agent's transcript rather than starting a fresh one: the
+          // path is deterministic per agent+session, so writing an initial entry
+          // would truncate the previous run's turns (see ensureOutputFile).
+          if (outputTranscript) {
+            existing.outputFile = createOutputFilePath(ctx.cwd, id, ctx.sessionManager.getSessionId());
+            ensureOutputFile(existing.outputFile);
+          }
+          // Anchor streaming past the turns already on disk, captured BEFORE the
+          // run starts. The resumed prompt lands as an ordinary user message at
+          // this index, so it is written exactly once.
+          const transcriptAnchor = existing.session.messages.length;
+
+          const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns);
+          // resumeAgent has no onSessionCreated — the session predates this run —
+          // so seed it directly, or the widget shows no context % for the agent.
+          bgState.session = existing.session;
+
+          // No `signal`: a background spawn deliberately omits it, and a detached
+          // resume must behave the same. Passing it would abort this agent when
+          // the parent turn is interrupted (user Esc), while agents started with
+          // run_in_background in that same turn keep going.
+          const record = await manager.resume(params.resume, params.prompt, undefined, {
+            isBackground: true,
+            onToolActivity: bgCallbacks.onToolActivity,
+            onAssistantUsage: bgCallbacks.onAssistantUsage,
+            // Fires when the run actually starts — immediately, or on queue
+            // drain. Wiring it here (rather than after resume() returns) means a
+            // resume stopped while still queued never started streaming, so
+            // there is no subscription left behind for a later run to trip over.
+            onStarted: () => {
+              const rec = manager.getRecord(id);
+              if (rec?.session && rec.outputFile) {
+                rec.outputCleanup = streamToOutputFile(rec.session, rec.outputFile, id, ctx.cwd, transcriptAnchor);
+              }
+            },
+          });
+          if (!record) {
+            return textResult(`Failed to resume agent "${params.resume}".`);
+          }
+
+          if (joinMode != null && joinMode !== 'async') {
+            currentBatchAgents.push({ id, joinMode });
+            if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+            batchFinalizeTimer = setTimeout(finalizeBatch, 100);
+          }
+
+          agentActivity.set(id, bgState);
+          // This agent already finished once, so the widget holds a finished-age
+          // for it that is past the linger limit — without clearing it, the
+          // resumed run's ✓/✗ line never renders and the agent just vanishes.
+          widget.markRunning(id);
+          widget.ensureTimer();
+          widget.update();
+          fleet.ensureTimer();
+          fleet.update();
+
+          // Resume ignores subagent_type (the record keeps the type it was
+          // spawned with), so report the record's own identity — a "created"
+          // event carrying the caller's type would re-register the agent under
+          // the wrong one in cross-extension mirrors keyed by id.
+          pi.events.emit("subagents:created", {
+            id,
+            type: existing.type,
+            description: existing.description,
+            isBackground: true,
+          });
+
+          const isQueued = record.status === "queued";
+          return textResult(
+            `Agent ${isQueued ? "queued" : "resumed"} in background.\n` +
+            `Agent ID: ${id}\n` +
+            `Type: ${existing.type}\n` +
+            (record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
+            (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
+            `\nYou will be notified when this agent completes.\n` +
+            `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
+            { ...detailBase, subagentType: existing.type, displayName: existing.type, toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
+          );
+        }
+
         const record = await manager.resume(params.resume, params.prompt, signal);
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
@@ -1256,23 +1430,22 @@ Terse command-style prompts produce shallow, generic work.
           }
         };
 
-        try {
-          id = manager.spawn(pi, ctx, subagentType, params.prompt, {
-            description: params.description,
-            model,
-            maxTurns: effectiveMaxTurns,
-            isolated,
-            inheritContext,
-            thinkingLevel: thinking,
-            isBackground: true,
-            isolation,
-            invocation: agentInvocation,
-            rootSessionId: ctx.sessionManager.getSessionId(),
-            ...bgCallbacks,
-          });
-        } catch (err) {
-          return textResult(err instanceof Error ? err.message : String(err));
-        }
+        // A throw here means the agent never started. Let it out: pi marks a
+        // tool call failed only when execute throws, and a returned message
+        // reads to the model as a subagent that ran and reported this (#179).
+        id = manager.spawn(pi, ctx, subagentType, params.prompt, {
+          description: params.description,
+          model,
+          maxTurns: effectiveMaxTurns,
+          isolated,
+          inheritContext,
+          thinkingLevel: thinking,
+          isBackground: true,
+          isolation,
+          invocation: agentInvocation,
+          rootSessionId: ctx.sessionManager.getSessionId(),
+          ...bgCallbacks,
+        });
 
         // Set output file + join mode synchronously after spawn, before the
         // event loop yields — onSessionCreated is async so this is safe.
@@ -1403,18 +1576,16 @@ Terse command-style prompts produce shallow, generic work.
           attachTranscript(fgRec, fgAgentId);
         });
         record = fgResult.record;
-      } catch (err) {
+      } finally {
+        // Runs on both paths, so a startup throw — which now propagates, see
+        // the background spawn above (#179) — no longer leaves the spinner
+        // ticking or a finished agent on the widget.
         clearInterval(spinnerInterval);
-        return textResult(err instanceof Error ? err.message : String(err));
-      }
-
-      clearInterval(spinnerInterval);
-
-      // Clean up foreground agent from widget
-      if (fgId) {
-        agentActivity.delete(fgId);
-        widget.markFinished(fgId);
-        fleet.onAgentFinished(fgId);
+        if (fgId) {
+          agentActivity.delete(fgId);
+          widget.markFinished(fgId);
+          fleet.onAgentFinished(fgId);
+        }
       }
 
       // Get final token count
@@ -1578,20 +1749,9 @@ Terse command-style prompts produce shallow, generic work.
 
   // ---- /agents interactive menu ----
 
-  const projectAgentsDir = () => join(process.cwd(), ".pi", "agents");
-  const workspaceAgentsDir = () => join(process.cwd(), ".agents", "agents");
-  const personalAgentsDir = () => join(getAgentDir(), "agents");
-
-  /** Find the file path of a custom agent by name, in discovery-precedence order (project, workspace, then global). */
-  function findAgentFile(name: string): { path: string; location: "project" | "workspace" | "personal" } | undefined {
-    const projectPath = join(projectAgentsDir(), `${name}.md`);
-    if (existsSync(projectPath)) return { path: projectPath, location: "project" };
-    const workspacePath = join(workspaceAgentsDir(), `${name}.md`);
-    if (existsSync(workspacePath)) return { path: workspacePath, location: "workspace" };
-    const personalPath = join(personalAgentsDir(), `${name}.md`);
-    if (existsSync(personalPath)) return { path: personalPath, location: "personal" };
-    return undefined;
-  }
+  // Directory resolution and the frontmatter edits live in agent-file-toggle.ts
+  // so they are reachable from tests — this command handler is only registered
+  // through `registerCommand`, which every test mocks.
 
   function getModelLabel(type: string, registry?: ModelRegistry): string {
     const cfg = getAgentConfig(type);
@@ -1746,19 +1906,15 @@ Terse command-style prompts produce shallow, generic work.
       return;
     }
 
-    const options = agents.map(a => {
+    // Numbered + item-paired. Two same-type agents spawned together with the
+    // same description render identically here, and resolving the choice by
+    // string match would open whichever came first.
+    const record = await selectItem(ctx.ui, "Running agents", agents, a => {
       const dn = getDisplayName(a.type);
       const dur = formatDuration(a.startedAt, a.completedAt);
       return `${dn} (${a.description}) · ${a.toolUses} tools · ${a.status} · ${dur}`;
     });
-
-    const choice = await ctx.ui.select("Running agents", options);
-    if (!choice) return;
-
-    // Find the selected agent by matching the option index
-    const idx = options.indexOf(choice);
-    if (idx < 0) return;
-    const record = agents[idx];
+    if (!record) return;
 
     await viewAgentConversation(ctx, record);
     // Back-navigation: re-show the list
@@ -1872,32 +2028,7 @@ Terse command-style prompts produce shallow, generic work.
       if (!overwrite) return;
     }
 
-    // Build the .md file content
-    const fmFields: string[] = [];
-    fmFields.push(`description: ${JSON.stringify(cfg.description)}`);
-    if (cfg.displayName) fmFields.push(`display_name: ${cfg.displayName}`);
-    fmFields.push(`tools: ${cfg.builtinToolNames?.join(", ") || "all"}`);
-    if (cfg.model) fmFields.push(`model: ${cfg.model}`);
-    if (cfg.thinking) fmFields.push(`thinking: ${cfg.thinking}`);
-    if (cfg.maxTurns) fmFields.push(`max_turns: ${cfg.maxTurns}`);
-    if (cfg.allowedSubagents !== undefined) {
-      fmFields.push(`allowed_subagents: ${cfg.allowedSubagents === "all" ? "all" : cfg.allowedSubagents.join(", ")}`);
-    }
-    fmFields.push(`prompt_mode: ${cfg.promptMode}`);
-    if (cfg.extensions === false) fmFields.push("extensions: false");
-    else if (Array.isArray(cfg.extensions)) fmFields.push(`extensions: ${cfg.extensions.join(", ")}`);
-    if (cfg.excludeExtensions?.length) fmFields.push(`exclude_extensions: ${cfg.excludeExtensions.join(", ")}`);
-    if (cfg.skills === false) fmFields.push("skills: false");
-    else if (Array.isArray(cfg.skills)) fmFields.push(`skills: ${cfg.skills.join(", ")}`);
-    if (cfg.disallowedTools?.length) fmFields.push(`disallowed_tools: ${cfg.disallowedTools.join(", ")}`);
-    if (cfg.inheritContext) fmFields.push("inherit_context: true");
-    if (cfg.runInBackground) fmFields.push("run_in_background: true");
-    if (cfg.outputTranscript === false) fmFields.push("output_transcript: false");
-    if (cfg.isolated) fmFields.push("isolated: true");
-    if (cfg.memory) fmFields.push(`memory: ${cfg.memory}`);
-    if (cfg.isolation) fmFields.push(`isolation: ${cfg.isolation}`);
-
-    const content = `---\n${fmFields.join("\n")}\n---\n\n${cfg.systemPrompt}\n`;
+    const content = serializeAgentFile(cfg);
 
     const { writeFileSync } = await import("node:fs");
     writeFileSync(targetPath, content, "utf-8");
@@ -1911,11 +2042,17 @@ Terse command-style prompts produce shallow, generic work.
     if (file) {
       // Existing file — set enabled: false in frontmatter (idempotent)
       const content = readFileSync(file.path, "utf-8");
-      if (content.includes("\nenabled: false\n")) {
+      const { content: updated, outcome } = disableInContent(content);
+      if (outcome === "already-disabled") {
         ctx.ui.notify(`${name} is already disabled.`, "info");
         return;
       }
-      const updated = content.replace(/^---\n/, "---\nenabled: false\n");
+      if (outcome === "no-frontmatter") {
+        // Nothing to edit — say so rather than rewriting the file unchanged and
+        // reporting success for a change that never happened.
+        ctx.ui.notify(`Cannot disable ${name}: ${file.path} has no frontmatter block.`, "error");
+        return;
+      }
       const { writeFileSync } = await import("node:fs");
       writeFileSync(file.path, updated, "utf-8");
       reloadCustomAgents();
@@ -1946,11 +2083,17 @@ Terse command-style prompts produce shallow, generic work.
     if (!file) return;
 
     const content = readFileSync(file.path, "utf-8");
-    const updated = content.replace(/^(---\n)enabled: false\n/, "$1");
+    const { content: updated, changed } = enableInContent(content);
+    if (!changed && !isEmptyStub(updated)) {
+      // The file carries no `enabled: false` to remove, so it was never disabled
+      // by us — reporting success here would hide a no-op.
+      ctx.ui.notify(`${name} is not disabled in ${file.path}.`, "info");
+      return;
+    }
     const { writeFileSync } = await import("node:fs");
 
     // If the file was just a stub ("---\n---\n"), delete it to restore the built-in default
-    if (updated.trim() === "---\n---" || updated.trim() === "---\n---\n") {
+    if (isEmptyStub(updated)) {
       unlinkSync(file.path);
       reloadCustomAgents();
       ctx.ui.notify(`Enabled ${name} (removed ${file.path})`, "info");
@@ -2009,6 +2152,7 @@ The file format is a markdown file with YAML frontmatter and a system prompt bod
 \`\`\`markdown
 ---
 description: <one-line description shown in UI>
+color: <optional agent name badge color: red, blue, green, yellow, purple, orange, pink, cyan, an Agency Agents alias, or quoted "#RRGGBB">
 tools: <comma-separated built-in tools: read, bash, edit, write, grep, find, ls. Use "none" for no tools. Omit for all tools>
 model: <optional model as "provider/modelId". Omit to inherit parent model>
 thinking: <optional thinking level: ${THINKING_LEVELS.join(", ")}. Omit to inherit>
@@ -2092,10 +2236,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
     ]);
     if (!modelChoice) return;
 
-    let modelLine = "";
-    if (modelChoice === "custom model (provider/modelId)") {
-      const customModel = await ctx.ui.input("Model (provider/modelId)");
-      if (customModel) modelLine = `\nmodel: ${customModel}`;
+    let model: string | undefined;
+    if (modelChoice === "haiku") model = "anthropic/claude-haiku-4-5";
+    else if (modelChoice === "sonnet") model = "anthropic/claude-sonnet-4-6";
+    else if (modelChoice === "opus") model = "anthropic/claude-opus-4-6";
+    else if (modelChoice === "custom model (provider/modelId)") {
+      model = (await ctx.ui.input("Model (provider/modelId)")) || undefined;
+    }
     }
     // "inherit (parent model)" → no model field = inherits parent model (Qwen on lemonade)
 
@@ -2104,22 +2251,17 @@ Write the file using the write tool. Only write the file, nothing else.`;
     const thinkingChoice = await ctx.ui.select("Thinking level", ["inherit", ...THINKING_LEVELS]);
     if (!thinkingChoice) return;
 
-    let thinkingLine = "";
-    if (thinkingChoice !== "inherit") thinkingLine = `\nthinking: ${thinkingChoice}`;
-
     // 6. System prompt
     const systemPrompt = await ctx.ui.editor("System prompt", "");
     if (systemPrompt === undefined) return;
 
-    // Build the file
-    const content = `---
-description: ${description}
-tools: ${tools}${modelLine}${thinkingLine}
-prompt_mode: replace
----
-
-${systemPrompt}
-`;
+    const content = buildNewAgentFile({
+      description,
+      tools,
+      model,
+      thinking: thinkingChoice === "inherit" ? undefined : thinkingChoice,
+      systemPrompt,
+    });
 
     mkdirSync(targetDir, { recursive: true });
     const targetPath = join(targetDir, `${name}.md`);
@@ -2135,7 +2277,16 @@ ${systemPrompt}
     ctx.ui.notify(`Created ${targetPath}`, "info");
   }
 
-  function snapshotSettings(): SubagentsSettings {
+  /**
+   * Every settings mutation writes this WHOLE object back to disk, so a field
+   * missing here is erased from the user's subagents.json the next time they
+   * toggle something unrelated. `SubagentsSettings` has every field optional,
+   * so a `: SubagentsSettings` return annotation would let a newly-added setting
+   * be forgotten here and still type-check. `satisfies` instead: it still checks
+   * each value's type and rejects a mistyped key, but leaves the return type
+   * inferred so `_NoMissingSettingsKeys` below can check completeness.
+   */
+  function snapshotSettings() {
     return {
       maxConcurrent: manager.getMaxConcurrent(),
       // 0 = unlimited — per SubagentsSettings.defaultMaxTurns docstring and
@@ -2145,6 +2296,7 @@ ${systemPrompt}
       defaultJoinMode: getDefaultJoinMode(),
       schedulingEnabled: isSchedulingEnabled(),
       scopeModels: isScopeModelsEnabled(),
+      strictAgentFiles,
       disableDefaultAgents: isDefaultsDisabled(),
       toolDescriptionMode: getToolDescriptionMode(),
       fleetView: isFleetViewEnabled(),
@@ -2156,8 +2308,19 @@ ${systemPrompt}
       // explicit configuration — which then fails loudly if general-purpose later
       // goes away. undefined is dropped by JSON.stringify.
       fallbackSubagent: getFallbackSubagent(),
-    };
+    } satisfies SubagentsSettings;
   }
+
+  // Compile-time completeness guard for snapshotSettings(). If a field is added
+  // to SubagentsSettings and not mirrored above, this Exclude is non-empty and
+  // fails to satisfy `never` — turning a silent settings-erasure bug into a
+  // typecheck error. `npm run typecheck` runs in CI.
+  type _NoMissingSettingsKeys =
+    Exclude<keyof SubagentsSettings, keyof ReturnType<typeof snapshotSettings>> extends never
+      ? true
+      : ["snapshotSettings() is missing a SubagentsSettings key"];
+  const _settingsSnapshotIsComplete: _NoMissingSettingsKeys = true;
+  void _settingsSnapshotIsComplete;
 
   const NUMERIC_IDS = new Set(["maxConcurrent", "defaultMaxTurns", "graceTurns", "maxSubagentDepth"]);
 
@@ -2223,6 +2386,13 @@ ${systemPrompt}
           label: "Scope models",
           description: "Validate subagent models against scoped models (/scoped-models)",
           currentValue: isScopeModelsEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "strictAgentFiles",
+          label: "Strict agent files",
+          description: "Fail startup on an unreadable/unparseable agent .md instead of skipping it with a warning",
+          currentValue: strictAgentFiles ? "on" : "off",
           values: ["on", "off"],
         },
         {
@@ -2322,6 +2492,10 @@ ${systemPrompt}
         const enabled = value === "on";
         setScopeModelsEnabled(enabled);
         notifyApplied(ctx, `Scope models ${enabled ? "enabled" : "disabled"}`);
+      } else if (id === "strictAgentFiles") {
+        const enabled = value === "on";
+        strictAgentFiles = enabled;
+        notifyApplied(ctx, `Strict agent files ${enabled ? "enabled" : "disabled"}. Takes effect on next pi session.`);
       } else if (id === "disableDefaultAgents") {
         const enabled = value === "on";
         setDisableDefaultAgents(enabled);
