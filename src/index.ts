@@ -2295,6 +2295,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
       defaultJoinMode: getDefaultJoinMode(),
       schedulingEnabled: isSchedulingEnabled(),
       scopeModels: isScopeModelsEnabled(),
+      // undefined is dropped by JSON.stringify — omit the key when unset.
+      globalDefaultModel: getGlobalDefaultModel(),
       strictAgentFiles,
       disableDefaultAgents: isDefaultsDisabled(),
       toolDescriptionMode: getToolDescriptionMode(),
