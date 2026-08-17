@@ -2243,7 +2243,6 @@ Write the file using the write tool. Only write the file, nothing else.`;
     else if (modelChoice === "custom model (provider/modelId)") {
       model = (await ctx.ui.input("Model (provider/modelId)")) || undefined;
     }
-    }
     // "inherit (parent model)" → no model field = inherits parent model (Qwen on lemonade)
 
     // 5. Thinking
