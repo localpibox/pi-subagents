@@ -17,7 +17,7 @@ lpb master       ──→ [lpb patch]──┘
 
 ### Working on a patch
 
-1. Fork or clone `localpibox/pi-subagents`
+1. Fork or clone `lpb-stack/pi-subagents`
 2. Make your changes in a feature branch
 3. Squash into one commit: `git commit -S -s --squash`
 4. Push and open a PR against `master`
@@ -40,7 +40,7 @@ git push --force-with-lease origin master
 
 If you want to personalize this extension:
 
-1. **Fork** `localpibox/pi-subagents` to your own GitHub account
+1. **Fork** `lpb-stack/pi-subagents` to your own GitHub account
 2. **Customize** — adjust default agents, add custom model selections, or tweak
    the registry behavior
 3. **Install** from your fork:
@@ -49,12 +49,12 @@ If you want to personalize this extension:
    ```
 4. **Repoint** any existing installations:
    ```bash
-   pi remove git:github.com/localpibox/pi-subagents
+   pi remove git:github.com/lpb-stack/pi-subagents
    pi install git:github.com/<you>/pi-subagents@<your-branch>
    ```
 
 See the
-[Forking & Repointing guide](https://github.com/localpibox/devstack#forking--repointing)
+[Forking & Repointing guide](https://github.com/lpb-stack/devstack#forking--repointing)
 for the full stack procedure.
 
 ## Feeding Back Upstream
@@ -82,8 +82,8 @@ upstream contribution**.
 ## Reporting Issues
 
 - **Extension core issues** → [tintinweb/pi-subagents/issues](https://github.com/tintinweb/pi-subagents/issues)
-- **LocalPibox patch issues** → [localpibox/pi-subagents/issues](https://github.com/localpibox/pi-subagents/issues)
-- **Stack configuration** → [localpibox/devstack/issues](https://github.com/localpibox/devstack/issues)
+- **LocalPibox patch issues** → [lpb-stack/pi-subagents/issues](https://github.com/lpb-stack/pi-subagents/issues)
+- **Stack configuration** → [lpb-stack/devstack/issues](https://github.com/lpb-stack/devstack/issues)
 
 ## Communication
 
