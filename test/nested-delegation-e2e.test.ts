@@ -150,6 +150,8 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
         subagent_type: "orchestrator",
         description: "delegate",
         prompt: "Delegate this downward.",
+        // Foreground: this test reads the parent's inline Agent tool result.
+        run_in_background: false,
       });
     };
 
@@ -212,6 +214,8 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
         subagent_type: "orchestrator",
         description: "delegate",
         prompt: "Delegate this downward.",
+        // Foreground: this test reads the parent's inline Agent tool result.
+        run_in_background: false,
       });
     };
 

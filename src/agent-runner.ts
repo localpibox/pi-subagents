@@ -27,6 +27,7 @@ import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { LifetimeUsage } from "./usage.js";
 
 /**
  * Tool names registered by THIS extension. Single source of truth so the
@@ -312,6 +313,33 @@ export function getDefaultMaxTurns(): number | undefined { return defaultMaxTurn
 /** Set the default max turns value. undefined or 0 = unlimited, otherwise minimum 1. */
 export function setDefaultMaxTurns(n: number | undefined): void { defaultMaxTurns = normalizeMaxTurns(n); }
 
+/**
+ * The turn limit a run of `type` will actually enforce: an explicit value if the
+ * caller supplied one, else the agent's own `max_turns`, else the project
+ * default. `undefined` = unlimited.
+ *
+ * Exported because the widget's turn counter (`↻3≤20`) has to predict this
+ * before the run starts, and a second copy of the expression would drift from
+ * the one below that enforces it.
+ */
+export function resolveEffectiveMaxTurns(type: string, explicit?: number): number | undefined {
+  return normalizeMaxTurns(explicit ?? getAgentConfig(type)?.maxTurns ?? defaultMaxTurns);
+}
+
+/**
+ * Project default for `persist_session`, from the `rememberAgents` setting.
+ * On by default: a persisted session is what lets `@handle` reopen an agent's
+ * conversation after its record has been evicted, which is the whole point of
+ * addressing an agent by a name that outlives one run. Per-agent frontmatter
+ * still overrides it in both directions.
+ */
+let rememberAgents = true;
+
+/** Whether subagent sessions are persisted by default. */
+export function getRememberAgents(): boolean { return rememberAgents; }
+/** Set whether subagent sessions are persisted by default. */
+export function setRememberAgents(b: boolean): void { rememberAgents = b; }
+
 /** Additional turns allowed after the soft limit steer message. */
 let graceTurns = 5;
 
@@ -387,6 +415,23 @@ export interface RunOptions {
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
+  /**
+   * Reopen this pi session file rather than starting an empty conversation.
+   * `createAgentSession` seeds itself from whatever its SessionManager holds,
+   * so pointing it at an existing file rehydrates that agent's history and the
+   * prompt continues it. Everything else — tools, model, system prompt, turn
+   * caps — is still resolved from the agent type, so the continuation runs
+   * under the type's *current* definition, not the one the original run used.
+   */
+  resumeSessionFile?: string;
+  /**
+   * True when another agent spawned this one. Only top-level agents get a
+   * handle, so only they can be reopened by name — which is the whole reason
+   * `rememberAgents` persists a session at all. A nested run's transcript would
+   * be unreachable by anything, so it stays in memory unless its own
+   * frontmatter asks otherwise.
+   */
+  nested?: boolean;
   /** Override working directory (e.g. for worktree isolation). */
   cwd?: string;
   /**
@@ -420,8 +465,13 @@ export interface RunOptions {
    * Called once per assistant message_end with that message's usage delta.
    * Lets callers maintain a lifetime accumulator that survives compaction
    * (which replaces session.state.messages and resets stats-derived sums).
+   *
+   * `cost` is pi's own `usage.cost.total` for that message — priced from the
+   * model's rates, so it is 0 (not missing) for a model pi has no pricing for.
+   * We never price anything ourselves; every dollar figure this extension shows
+   * or reports traces back to this field.
    */
-  onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+  onAssistantUsage?: (usage: LifetimeUsage) => void;
   /**
    * Called when the session successfully compacts. `tokensBefore` is upstream's
    * pre-compaction context size estimate. Aborted compactions don't fire.
@@ -857,11 +907,25 @@ export async function runAgent(
   const settingsManager = SettingsManager.create(configCwd, agentDir);
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
-  const sessionManager = agentConfig?.persistSession
-    ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir, {
-        parentSession: ctx.sessionManager.getSessionFile(),
-      })
-    : SessionManager.inMemory(effectiveCwd);
+  // Frontmatter wins when it says anything; otherwise the project default,
+  // which `rememberAgents` supplies for top-level agents only. Same precedence
+  // as `outputTranscript`.
+  const persistSession = agentConfig?.persistSession ?? (options.nested ? false : rememberAgents);
+  const sessionManager = options.resumeSessionFile
+    // Reopening an existing conversation: the file already carries its own
+    // header (cwd, parent) and history, so none of the create-time options
+    // apply. `sessionDir` still matters for a later /new or /branch off it.
+    ? SessionManager.open(options.resumeSessionFile, configuredSessionDir ?? defaultSessionDir)
+    : persistSession
+      ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir, {
+          // Optional metadata — it only nests the subagent under its spawner in
+          // `/resume`. Until `rememberAgents` this ran solely for the rare
+          // `persist_session: true` agent; now it runs for every spawn, so a
+          // context without a session manager (a bare programmatic ctx) must
+          // still persist rather than take the whole spawn down.
+          parentSession: ctx.sessionManager?.getSessionFile?.(),
+        })
+      : SessionManager.inMemory(effectiveCwd);
 
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.
@@ -934,7 +998,7 @@ export async function runAgent(
 
   // Track turns for graceful max_turns enforcement
   let turnCount = 0;
-  const maxTurns = normalizeMaxTurns(options.maxTurns ?? agentConfig?.maxTurns ?? defaultMaxTurns);
+  const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
   let softLimitReached = false;
   let aborted = false;
 
@@ -972,6 +1036,8 @@ export async function runAgent(
         input: u.input ?? 0,
         output: u.output ?? 0,
         cacheWrite: u.cacheWrite ?? 0,
+        cacheRead: u.cacheRead ?? 0,
+        cost: u.cost?.total ?? 0,
       });
     }
     if (event.type === "compaction_end" && !event.aborted && event.result) {
@@ -1014,7 +1080,7 @@ export async function resumeAgent(
   prompt: string,
   options: {
     onToolActivity?: (activity: ToolActivity) => void;
-    onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+    onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
   } = {},
@@ -1036,6 +1102,8 @@ export async function resumeAgent(
             input: u.input ?? 0,
             output: u.output ?? 0,
             cacheWrite: u.cacheWrite ?? 0,
+            cacheRead: u.cacheRead ?? 0,
+            cost: u.cost?.total ?? 0,
           });
         }
         if (event.type === "compaction_end" && !event.aborted && event.result) {

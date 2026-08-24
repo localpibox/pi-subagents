@@ -15,9 +15,12 @@ vi.mock("../src/worktree.js", () => ({
   createWorktree: vi.fn(),
   cleanupWorktree: vi.fn(() => ({ hasChanges: false })),
   pruneWorktrees: vi.fn(),
+  isWorktreeIsolationEnabled: vi.fn(() => true),
 }));
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
+import { addUsage } from "../src/usage.js";
+import { isWorktreeIsolationEnabled } from "../src/worktree.js";
 
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
@@ -250,6 +253,27 @@ describe("AgentManager — nested runtime propagation", () => {
           maxSubagentDepth: 3,
         },
       }),
+    );
+  });
+
+  it("tells the runner which spawns are nested, so only top-level ones persist", async () => {
+    // `rememberAgents` exists so `@handle` can reopen a conversation. A nested
+    // child never gets a handle, so persisting it writes a session file nothing
+    // can ever reach — the runner needs the fact to decline.
+    resolvedRun();
+    manager = new AgentManager();
+    const child = manager.spawn(mockPi, mockCtx, "scout", "child", {
+      description: "child", isBackground: true, depth: 2, parentAgentId: "parent-1",
+    });
+    await manager.getRecord(child)!.promise;
+    expect(runAgent).toHaveBeenLastCalledWith(
+      mockCtx, "scout", "child", expect.objectContaining({ nested: true }),
+    );
+
+    const top = manager.spawn(mockPi, mockCtx, "scout", "top", { description: "top", isBackground: true });
+    await manager.getRecord(top)!.promise;
+    expect(runAgent).toHaveBeenLastCalledWith(
+      mockCtx, "scout", "top", expect.objectContaining({ nested: false }),
     );
   });
 
@@ -551,6 +575,74 @@ describe("AgentManager — Bug 3 clearCompleted", () => {
   });
 });
 
+// The manager-level usage hook is the ONE place every assistant message is seen
+// exactly once, which is what parent-session accounting (#193) is built on.
+// `record.lifetimeUsage` cannot serve: nested spend is deliberately double-booked
+// into every ancestor so a hidden child shows up on a record a human can see.
+describe("AgentManager — the usage hook fires once per assistant message", () => {
+  let manager: AgentManager;
+
+  afterEach(() => {
+    manager?.dispose();
+  });
+
+  it("fires once per message, with the same delta the record accumulates", async () => {
+    const seen: any[] = [];
+    manager = new AgentManager(undefined, undefined, undefined, undefined, (r, u) => seen.push({ id: r.id, u }));
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, opts: any) => {
+      opts.onAssistantUsage?.({ input: 100, output: 50, cacheWrite: 10, cost: 0.01 });
+      opts.onAssistantUsage?.({ input: 200, output: 80, cacheWrite: 20, cost: 0.02 });
+      return { responseText: "done", session: mockSession(), aborted: false, steered: false };
+    });
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(seen.map(s => s.u)).toEqual([
+      { input: 100, output: 50, cacheWrite: 10, cost: 0.01 },
+      { input: 200, output: 80, cacheWrite: 20, cost: 0.02 },
+    ]);
+    expect(seen.every(s => s.id === id)).toBe(true);
+  });
+
+  it("fires once for a nested child, even though its spend is booked to ancestors too", async () => {
+    // Mimics `nested-tools.ts`: the caller's own onAssistantUsage walks the
+    // ancestor chain. If the hook sat below that walk — or if accounting read
+    // the records it writes — one child message would be billed twice.
+    const seen: any[] = [];
+    manager = new AgentManager(undefined, undefined, undefined, undefined, (_r, u) => seen.push(u));
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, opts: any) => {
+      opts.onAssistantUsage?.({ input: 10, output: 5, cacheWrite: 0, cost: 0.001 });
+      return { responseText: "done", session: mockSession(), aborted: false, steered: false };
+    });
+
+    const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", {
+      description: "parent",
+      isBackground: true,
+    });
+    await manager.getRecord(parentId)!.promise;
+    seen.length = 0;
+
+    const childId = manager.spawn(mockPi, mockCtx, "general-purpose", "child", {
+      description: "child",
+      isBackground: true,
+      parentAgentId: parentId,
+      onAssistantUsage: (u: any) => { addUsage(manager.getRecord(parentId)!.lifetimeUsage, u); },
+    } as any);
+    await manager.getRecord(childId)!.promise;
+
+    expect(seen).toEqual([{ input: 10, output: 5, cacheWrite: 0, cost: 0.001 }]);
+    // And here is why the hook has to exist: the parent's record now carries the
+    // child's message on top of its own identical one, so anything that summed
+    // records would bill this session for two messages when one was sent. The
+    // double-booking stays — it is what makes a hidden child visible.
+    expect(manager.getRecord(parentId)!.lifetimeUsage).toEqual({ input: 20, output: 10, cacheWrite: 0, cost: 0.002 });
+  });
+});
+
 // Eager init removes the optional/required asymmetry that previously required
 // `??=` defaults at the callback sites and `?? 0` / `?? 1` at the read sites.
 describe("AgentManager — lifetime usage + compaction count are eagerly initialized", () => {
@@ -571,7 +663,7 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
     });
     const record = manager.getRecord(id)!;
 
-    expect(record.lifetimeUsage).toEqual({ input: 0, output: 0, cacheWrite: 0 });
+    expect(record.lifetimeUsage).toEqual({ input: 0, output: 0, cacheWrite: 0, cost: 0 });
     expect(record.compactionCount).toBe(0);
 
     manager.abort(id);
@@ -585,8 +677,8 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
     vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, opts: any) => {
       captured = opts;
       // Two assistant messages with usage
-      opts.onAssistantUsage?.({ input: 100, output: 50, cacheWrite: 10 });
-      opts.onAssistantUsage?.({ input: 200, output: 80, cacheWrite: 20 });
+      opts.onAssistantUsage?.({ input: 100, output: 50, cacheWrite: 10, cost: 0.01 });
+      opts.onAssistantUsage?.({ input: 200, output: 80, cacheWrite: 20, cost: 0.02 });
       return { responseText: "done", session: mockSession(), aborted: false, steered: false };
     });
 
@@ -598,7 +690,7 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
 
     expect(captured).toBeDefined();
     expect(manager.getRecord(id)!.lifetimeUsage).toEqual({
-      input: 300, output: 130, cacheWrite: 30,
+      input: 300, output: 130, cacheWrite: 30, cost: 0.03,
     });
   });
 
@@ -650,20 +742,20 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
     await manager.getRecord(id)!.promise;
 
     // Pre-resume: lifetimeUsage from spawn was zero (mock didn't call onAssistantUsage)
-    expect(manager.getRecord(id)!.lifetimeUsage).toEqual({ input: 0, output: 0, cacheWrite: 0 });
+    expect(manager.getRecord(id)!.lifetimeUsage).toEqual({ input: 0, output: 0, cacheWrite: 0, cost: 0 });
     expect(manager.getRecord(id)!.compactionCount).toBe(0);
 
     // Now resume — drive callbacks via the mocked resumeAgent
     const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
     vi.mocked(resumeMock).mockImplementation(async (_session, _prompt, opts: any) => {
-      opts.onAssistantUsage?.({ input: 70, output: 30, cacheWrite: 5 });
+      opts.onAssistantUsage?.({ input: 70, output: 30, cacheWrite: 5, cost: 0.007 });
       opts.onCompaction?.({ reason: "overflow", tokensBefore: 999 });
       return { text: "second" };
     });
 
     await manager.resume(id, "more");
 
-    expect(manager.getRecord(id)!.lifetimeUsage).toEqual({ input: 70, output: 30, cacheWrite: 5 });
+    expect(manager.getRecord(id)!.lifetimeUsage).toEqual({ input: 70, output: 30, cacheWrite: 5, cost: 0.007 });
     expect(manager.getRecord(id)!.compactionCount).toBe(1);
   });
 });
@@ -693,6 +785,46 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     expect(manager.listAgents()).toEqual([]);
     // runAgent never invoked — strict, no silent fallback
     expect(runAgent).not.toHaveBeenCalled();
+  });
+});
+
+// The project switch has to bite below the tool boundary: cross-extension RPC
+// forwards its options straight to spawn(), so a schema that omits the
+// isolation parameter can't stop a caller that never saw the schema (#184).
+describe("AgentManager — worktreeIsolation: false refuses worktrees", () => {
+  let manager: AgentManager;
+
+  afterEach(() => {
+    manager?.dispose();
+    vi.mocked(isWorktreeIsolationEnabled).mockReturnValue(true);
+  });
+
+  it("creates no worktree for an RPC-shaped spawn when the project disabled it", async () => {
+    const { createWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockClear();
+    vi.mocked(isWorktreeIsolationEnabled).mockReturnValue(false);
+
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isolation: "worktree",
+    });
+
+    // Downgraded, not rejected — the user opted out, so the call still runs.
+    expect(createWorktree).not.toHaveBeenCalled();
+    expect(manager.getRecord(id)!.worktree).toBeUndefined();
+  });
+
+  it("does not mask a genuine worktree failure while enabled", async () => {
+    const { createWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockReturnValueOnce(undefined);
+    vi.mocked(isWorktreeIsolationEnabled).mockReturnValue(true);
+
+    manager = new AgentManager();
+    expect(() => manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isolation: "worktree",
+    })).toThrow(/isolation: "worktree"/);
   });
 });
 
@@ -1625,7 +1757,7 @@ describe("AgentManager — background resume", () => {
     const onAssistantUsage = vi.fn();
     vi.mocked(resumeAgent).mockImplementation(async (_session, _prompt, opts: any) => {
       opts.onToolActivity?.({ type: "end", toolName: "grep" });
-      opts.onAssistantUsage?.({ input: 5, output: 3, cacheWrite: 0 });
+      opts.onAssistantUsage?.({ input: 5, output: 3, cacheWrite: 0, cost: 0 });
       return { text: "ok" };
     });
 
@@ -1637,10 +1769,10 @@ describe("AgentManager — background resume", () => {
     await record!.promise;
 
     expect(onToolActivity).toHaveBeenCalledWith({ type: "end", toolName: "grep" });
-    expect(onAssistantUsage).toHaveBeenCalledWith({ input: 5, output: 3, cacheWrite: 0 });
+    expect(onAssistantUsage).toHaveBeenCalledWith({ input: 5, output: 3, cacheWrite: 0, cost: 0 });
     // Internal record bookkeeping still runs alongside the forwarded callbacks.
     expect(manager.getRecord(id)!.toolUses).toBe(1);
-    expect(manager.getRecord(id)!.lifetimeUsage).toEqual({ input: 5, output: 3, cacheWrite: 0 });
+    expect(manager.getRecord(id)!.lifetimeUsage).toEqual({ input: 5, output: 3, cacheWrite: 0, cost: 0 });
   });
 
   it("queues a background resume when the concurrency pool is full", async () => {
@@ -1777,5 +1909,237 @@ describe("AgentManager — background resume", () => {
     expect(manager.abort(id)).toBe(true);
     expect(manager.getRecord(id)!.status).toBe("stopped");
     expect(onStarted).not.toHaveBeenCalled();
+  });
+});
+
+// A `name` on the spawn adds a SECOND handle rather than replacing the
+// type-derived one. That is the property the whole design rests on: if naming
+// freed up `explore`, then `@explore fix it` would quietly start a second
+// Explore alongside the running one instead of reaching it.
+describe("AgentManager — names as additive aliases", () => {
+  let manager: AgentManager;
+
+  afterEach(() => manager?.dispose());
+
+  const spawnNamed = (m: AgentManager, type: string, name?: string) =>
+    m.spawn(mockPi, mockCtx, type, "go", {
+      description: "go",
+      ...(name !== undefined && { name }),
+      isBackground: true,
+    });
+
+  it("assigns the type handle as well as the alias", () => {
+    resolvedRun();
+    manager = new AgentManager();
+    const record = manager.getRecord(spawnNamed(manager, "Explore", "auth-audit"))!;
+
+    expect(record.handle).toBe("explore");
+    expect(record.alias).toBe("auth-audit");
+  });
+
+  it("reaches the same agent by either name", () => {
+    resolvedRun();
+    manager = new AgentManager();
+    const id = spawnNamed(manager, "Explore", "auth-audit");
+
+    expect(manager.resolveMention("auth-audit")).toMatchObject({ kind: "live", record: { id } });
+    expect(manager.resolveMention("explore")).toMatchObject({ kind: "live", record: { id } });
+  });
+
+  it("slugs a name that isn't typeable rather than rejecting the spawn", () => {
+    resolvedRun();
+    manager = new AgentManager();
+    const record = manager.getRecord(spawnNamed(manager, "Explore", "Auth Audit!"))!;
+
+    expect(record.alias).toBe("auth-audit");
+  });
+
+  it("numbers an alias that collides with its own type handle", () => {
+    // `name: "explore"` on an Explore would otherwise produce two identical
+    // names on one record, and later a second agent could take one of them.
+    resolvedRun();
+    manager = new AgentManager();
+    const record = manager.getRecord(spawnNamed(manager, "Explore", "explore"))!;
+
+    expect(record.handle).toBe("explore");
+    expect(record.alias).toBe("explore-2");
+  });
+
+  it("stops a later type handle from colliding with an existing alias", () => {
+    resolvedRun();
+    manager = new AgentManager();
+    spawnNamed(manager, "Plan", "explore"); // alias squats the Explore name
+    const second = manager.getRecord(spawnNamed(manager, "Explore"))!;
+
+    expect(second.handle).toBe("explore-2");
+  });
+
+  it("refuses to alias an agent to the reserved main handle", () => {
+    resolvedRun();
+    manager = new AgentManager();
+    const record = manager.getRecord(spawnNamed(manager, "Explore", "main"))!;
+
+    expect(record.alias).toBe("main-2");
+  });
+
+  it("gives an unnamed agent no alias at all", () => {
+    resolvedRun();
+    manager = new AgentManager();
+    const record = manager.getRecord(spawnNamed(manager, "Explore"))!;
+
+    expect(record.alias).toBeUndefined();
+    expect(record.handle).toBe("explore");
+  });
+
+  it("never names a nested child, however it was spawned", () => {
+    // Nested agents are hidden from every top-level surface; a name would make
+    // one addressable through a boundary only its owner may cross.
+    resolvedRun();
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "Explore", "go", {
+      description: "go",
+      name: "child",
+      parentAgentId: "parent-1",
+      isBackground: true,
+    });
+
+    const record = manager.getRecord(id)!;
+    expect(record.alias).toBeUndefined();
+    expect(record.handle).toBeUndefined();
+    expect(manager.resolveMention("child")).toBeUndefined();
+  });
+
+  it("captures the session file so the agent can be resumed after eviction", async () => {
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, options: any) => {
+      options.onSessionCreated?.({
+        dispose: vi.fn(),
+        sessionManager: { getSessionFile: () => "/sessions/explore.jsonl" },
+      });
+      return { responseText: "done", session: mockSession(), aborted: false, steered: false } as any;
+    });
+    manager = new AgentManager();
+    const id = spawnNamed(manager, "Explore");
+    await manager.getRecord(id)!.promise;
+
+    expect(manager.getRecord(id)!.sessionFile).toBe("/sessions/explore.jsonl");
+  });
+
+  it("records no session file for an in-memory session", async () => {
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, options: any) => {
+      options.onSessionCreated?.({ dispose: vi.fn(), sessionManager: { getSessionFile: () => undefined } });
+      return { responseText: "done", session: mockSession(), aborted: false, steered: false } as any;
+    });
+    manager = new AgentManager();
+    const id = spawnNamed(manager, "Explore");
+    await manager.getRecord(id)!.promise;
+
+    expect(manager.getRecord(id)!.sessionFile).toBeUndefined();
+  });
+});
+
+describe("AgentManager — effective model and thinking write-back", () => {
+  let manager: AgentManager;
+
+  afterEach(() => {
+    manager?.dispose?.();
+    vi.restoreAllMocks();
+  });
+
+  /** Run a spawn whose session reports the given runtime model/level. */
+  async function spawnWithSession(
+    invocation: AgentRecord["invocation"],
+    runtime: { model?: { provider: string; id: string; name?: string }; thinkingLevel?: string },
+  ): Promise<AgentRecord> {
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, options: any) => {
+      options.onSessionCreated?.({ dispose: vi.fn(), ...runtime });
+      return { responseText: "done", session: mockSession(), aborted: false, steered: false } as any;
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "Explore", "go", {
+      description: "go",
+      isBackground: true,
+      invocation,
+    });
+    await manager.getRecord(id)!.promise;
+    return manager.getRecord(id)!;
+  }
+
+  it("relabels the record with the model the session actually runs", async () => {
+    const record = await spawnWithSession(
+      { modelName: "pre-session", modelId: "pre/session", thinking: "high" },
+      { model: { provider: "anthropic", id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" }, thinkingLevel: "high" },
+    );
+
+    expect(record.invocation).toMatchObject({
+      modelName: "sonnet 4.6",
+      modelId: "anthropic/claude-sonnet-4-6",
+      thinking: "high",
+    });
+  });
+
+  it("keeps the requested level when pi clamps it to what the model supports", async () => {
+    const record = await spawnWithSession(
+      { thinking: "max" },
+      { model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "high" },
+    );
+
+    expect(record.invocation!.thinking).toBe("high");
+    expect(record.invocation!.requestedThinking).toBe("max");
+  });
+
+  it("records no request when the level was honored", async () => {
+    const record = await spawnWithSession(
+      { thinking: "high" },
+      { model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "high" },
+    );
+
+    expect(record.invocation!.requestedThinking).toBeUndefined();
+  });
+
+  it("does not overwrite a request the agent file already overrode", async () => {
+    // Frontmatter pinned `low` over a caller's `max`, then the model clamped it
+    // again. The caller asked for `max` — that is what the surfaces must say,
+    // not the intermediate value frontmatter chose.
+    const record = await spawnWithSession(
+      { thinking: "low", requestedThinking: "max" },
+      { model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "minimal" },
+    );
+
+    expect(record.invocation!.thinking).toBe("minimal");
+    expect(record.invocation!.requestedThinking).toBe("max");
+  });
+
+  it("gives a spawn that carried no invocation one to display", async () => {
+    // Cross-extension RPC and `@handle` spawns pass none, and used to render no
+    // metadata at all.
+    const record = await spawnWithSession(
+      undefined,
+      { model: { provider: "openai-codex", id: "gpt-5.6-sol" }, thinkingLevel: "xhigh" },
+    );
+
+    expect(record.invocation).toEqual({
+      modelName: "gpt-5.6-sol",
+      modelId: "openai-codex/gpt-5.6-sol",
+      thinking: "xhigh",
+    });
+  });
+
+  it("keeps the requested level when the session reports no level of its own", async () => {
+    // An older pi or a stubbed session degrades to "nothing to say about the
+    // level", which must not read as "no level" on every surface.
+    const record = await spawnWithSession(
+      { thinking: "max" },
+      { model: { provider: "anthropic", id: "claude-haiku-4-5" } },
+    );
+
+    expect(record.invocation!.thinking).toBe("max");
+    expect(record.invocation!.requestedThinking).toBeUndefined();
+    expect(record.invocation!.modelName).toBe("claude-haiku-4-5");
+  });
+
+  it("leaves the invocation alone when the session reports no model", async () => {
+    const record = await spawnWithSession({ thinking: "max" }, {});
+
+    expect(record.invocation).toEqual({ thinking: "max" });
   });
 });

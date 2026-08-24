@@ -22,6 +22,10 @@ lpb master       ──→ [lpb patch]──┘
 3. Squash into one commit: `git commit -S -s --squash`
 4. Push and open a PR against `master`
 
+If your change touches a render path or the spawn path, `npm run bench` prints
+absolute timings and `npm run bench:ab -- master` compares them against master.
+Neither is required to pass; both are opt-in, and neither runs in CI.
+
 ### Rebasing onto new upstream changes
 
 ```bash

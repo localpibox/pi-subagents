@@ -26,8 +26,9 @@
  */
 
 import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { join, sep } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { parseAgentFrontmatter } from "./custom-agents.js";
 import type { AgentConfig } from "./types.js";
 
 export type AgentFileLocation = "project" | "workspace" | "personal";
@@ -55,6 +56,43 @@ export function findAgentFile(
   return undefined;
 }
 
+/**
+ * Find the file behind a *loaded* agent, preferring the path the loader
+ * actually read (`AgentConfig.sourcePath`) over the `<type>.md` guess.
+ *
+ * An agent's type comes from its frontmatter `name:` now, so the two can
+ * disagree: `reviewer.md` declaring `name: code-reviewer` is loaded as
+ * `code-reviewer`, and probing for `code-reviewer.md` finds nothing. That is
+ * not a harmless miss — `/agents → Disable` would then take the no-file branch
+ * and write a NEW `code-reviewer.md` stub, which loses to `reviewer.md` on
+ * load, leaving the agent enabled while reporting success.
+ *
+ * The probe stays as the fallback: a built-in that was never ejected has no
+ * `sourcePath`, and a path can go stale between a load and this call.
+ */
+export function locateAgentFile(
+  name: string,
+  sourcePath: string | undefined,
+  cwd: string = process.cwd(),
+): { path: string; location: AgentFileLocation } | undefined {
+  if (sourcePath && existsSync(sourcePath)) {
+    return { path: sourcePath, location: classifyAgentDir(sourcePath, cwd) };
+  }
+  return findAgentFile(name, cwd);
+}
+
+/**
+ * Which discovery location a loaded agent's file came from. Only ever names
+ * a directory in a confirmation prompt, so an unrecognized parent — which
+ * loadCustomAgents cannot currently produce — reports as personal rather than
+ * widening the type for a case that has no better answer.
+ */
+function classifyAgentDir(path: string, cwd: string): AgentFileLocation {
+  if (path.startsWith(projectAgentsDir(cwd) + sep)) return "project";
+  if (path.startsWith(workspaceAgentsDir(cwd) + sep)) return "workspace";
+  return "personal";
+}
+
 export type DisableOutcome = "disabled" | "already-disabled" | "no-frontmatter";
 
 /** A line that sets `enabled: false`, ignoring trailing whitespace / CR. */
@@ -64,18 +102,25 @@ const FENCE = /^---[ \t]*$/;
 
 /**
  * Split a file into its frontmatter lines and everything else, agreeing with
- * what `parseFrontmatter` (the load side) considers a frontmatter block.
+ * what `parseAgentFrontmatter` (the load side) considers a frontmatter block —
+ * including its BOM normalisation, which is why the fence test looks past one.
+ * The BOM itself stays in `lines[0]`: it belongs to the file's encoding, not to
+ * the block, and an edit must not strip it from the user's file.
  *
  * Lines keep their terminators, so an edit preserves the file's existing line
  * endings instead of rewriting CRLF to LF. Returns undefined when there is no
- * usable block — notably for a BOM-prefixed file, which the parser also reads
- * as having none, so writing a key into it would change nothing on load.
+ * usable block.
  */
 function splitFrontmatter(content: string):
   | { lines: string[]; openIdx: number; closeIdx: number; eol: string }
   | undefined {
   const lines = content.split(/(?<=\n)/);
-  if (lines.length === 0 || !FENCE.test(lines[0].replace(/\r?\n$/, ""))) return undefined;
+  if (lines.length === 0) return undefined;
+  // The BOM stays where it is — it belongs to the file, not the block — so the
+  // fence test looks past it and every index below is unaffected.
+  const bom = content.startsWith("\uFEFF");
+  const first = (bom ? lines[0].slice(1) : lines[0]).replace(/\r?\n$/, "");
+  if (!FENCE.test(first)) return undefined;
   const closeIdx = lines.findIndex((l, i) => i > 0 && FENCE.test(l.replace(/\r?\n$/, "")));
   if (closeIdx === -1) return undefined;
   return { lines, openIdx: 0, closeIdx, eol: lines[0].endsWith("\r\n") ? "\r\n" : "\n" };
@@ -94,7 +139,7 @@ function splitFrontmatter(content: string):
  */
 export function isDisabledContent(content: string): boolean {
   try {
-    return parseFrontmatter<Record<string, unknown>>(content).frontmatter.enabled === false;
+    return parseAgentFrontmatter<Record<string, unknown>>(content).frontmatter.enabled === false;
   } catch {
     return false;
   }
@@ -209,7 +254,12 @@ export function serializeAgentFile(cfg: AgentConfig): string {
   else if (Array.isArray(cfg.skills)) fmFields.push(`skills: ${cfg.skills.join(", ")}`);
   if (cfg.disallowedTools?.length) fmFields.push(`disallowed_tools: ${cfg.disallowedTools.join(", ")}`);
   if (cfg.inheritContext) fmFields.push("inherit_context: true");
-  if (cfg.runInBackground) fmFields.push("run_in_background: true");
+  // Both cases, not just `true`: with `backgroundByDefault` on, omitting the
+  // field means background, so `false` is the only way to pin an agent file to
+  // foreground and is no longer interchangeable with absence. No caller can
+  // reach it yet — Eject only handles built-in defaults, which omit the field —
+  // so this keeps the writer symmetric with the loader, nothing more.
+  if (cfg.runInBackground !== undefined) fmFields.push(`run_in_background: ${cfg.runInBackground}`);
   if (cfg.outputTranscript === false) fmFields.push("output_transcript: false");
   if (cfg.isolated) fmFields.push("isolated: true");
   if (cfg.memory) fmFields.push(`memory: ${cfg.memory}`);
