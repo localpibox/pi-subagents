@@ -180,6 +180,22 @@ export interface AgentRecord {
   session?: AgentSession;
   abortController?: AbortController;
   promise?: Promise<string>;
+  /**
+   * A caller is awaiting this agent inline (`spawnAndWait`) — what
+   * `maxConcurrentForeground` bounds. Distinct from `isBackground === false`,
+   * which says only that the agent has an inline result surface: a detached
+   * cross-extension RPC spawn is foreground by that measure and yet blocks
+   * nobody, so it takes no slot.
+   */
+  blocking?: boolean;
+  /**
+   * Present only while the record is "queued": resolves when it leaves the
+   * queue, started or aborted. `spawnAndWait` waits on this because a queued
+   * record has no `promise` yet. Always resolves, never rejects — a rejection
+   * would escape into the caller's tool `execute` and take down pi's whole
+   * Promise.all tool batch.
+   */
+  startGate?: Promise<void>;
   groupId?: string;
   joinMode?: JoinMode;
   /** Set when result was already consumed via get_subagent_result — suppresses completion notification. */
@@ -226,8 +242,27 @@ export interface AgentRecord {
   invocation?: AgentInvocation;
   /** Nesting depth: top-level subagent = 1. */
   depth?: number;
+  /**
+   * The validated `StructuredOutput` payload, as canonical JSON.
+   *
+   * Set only when the spawn asked for a schema. Separate from `result` because
+   * `result` is prose for a reader — previewed in the widget, written to the
+   * transcript, and appended to with the worktree branch note — and JSON that
+   * has been appended to no longer parses.
+   */
+  structuredJson?: string;
+  /** Whether the child needed the extra structured-output prompt. */
+  structuredRetried?: boolean;
   /** Parent agent ID for ownership-scoped nested controls. */
   parentAgentId?: string;
+  /**
+   * The workflow run that owns this child, when a workflow spawned it.
+   *
+   * Owned the same way a nested child is owned by its parent: filtered out of
+   * every top-level surface, and outside the `maxConcurrent` pool. See
+   * `isTopLevelAgent`.
+   */
+  workflowId?: string;
   /** Effective inherited nesting cap for this branch. */
   maxSubagentDepth?: number;
   /**
